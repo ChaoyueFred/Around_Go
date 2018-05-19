@@ -3,6 +3,7 @@ package main
 import (
     "context"
     "cloud.google.com/go/storage"
+    "cloud.google.com/go/bigtable"
     elastic "gopkg.in/olivere/elastic.v3"
     "io"
 	"fmt"
@@ -12,6 +13,9 @@ import (
 	"strconv"
     "reflect"
     "github.com/pborman/uuid"
+    "github.com/auth0/go-jwt-middleware"
+    "github.com/dgrijalva/jwt-go"
+    "github.com/gorilla/mux"
 )
 
 type Location struct {
@@ -32,13 +36,15 @@ const (
     TYPE = "post"
     DISTANCE = "200km"
     // Needs to update
-    //PROJECT_ID = "around-xxx"
-    //BT_INSTANCE = "around-post"
-    // Needs to update this bucket based on your gcs bucket name.
+    PROJECT_ID = "focus-poet-203921"
+    BT_INSTANCE = "around-post"
+    // Needs to update
     BUCKET_NAME = "around-post-images-203921"    
     // Needs to update this URL if you deploy it to cloud.
-    ES_URL = "http://35.233.228.185:9200"
+    ES_URL = "http://35.233.147.11:9200"
 )
+
+var mySigningKey = []byte("secret")
 
 func main() {
     // Create a client
@@ -75,9 +81,27 @@ func main() {
     }
 
 	fmt.Println("started-service")
-	http.HandleFunc("/post", handlerPost)
-	http.HandleFunc("/search", handlerSearch)
-	log.Fatal(http.ListenAndServe(":8080", nil))
+    r := mux.NewRouter()
+
+    var jwtMiddleware = jwtmiddleware.New(jwtmiddleware.Options{
+        ValidationKeyGetter: func(token *jwt.Token) (interface{}, error) {
+            return mySigningKey, nil
+        },
+        SigningMethod: jwt.SigningMethodHS256,
+    })
+
+    r.Handle("/post", jwtMiddleware.Handler(http.HandlerFunc(handlerPost))).Methods("POST")
+    r.Handle("/search", jwtMiddleware.Handler(http.HandlerFunc(handlerSearch))).Methods("GET")
+    r.Handle("/login", http.HandlerFunc(loginHandler)).Methods("POST")
+    r.Handle("/signup", http.HandlerFunc(signupHandler)).Methods("POST")
+
+    http.Handle("/", r)
+    log.Fatal(http.ListenAndServe(":8080", nil))
+
+
+	//http.HandleFunc("/post", handlerPost)
+	//http.HandleFunc("/search", handlerSearch)
+	//log.Fatal(http.ListenAndServe(":8080", nil))
 
 }
 
@@ -87,10 +111,13 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
     w.Header().Set("Access-Control-Allow-Origin", "*")
     w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization")
 
+    user := r.Context().Value("user")
+    claims := user.(*jwt.Token).Claims
+    username := claims.(jwt.MapClaims)["username"]
 
-      // 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
-      // After you call ParseMultipartForm, the file will be saved in the server memory with maxMemory size.
-      // If the file size is larger than maxMemory, the rest of the data will be saved in a system temporary file.
+    // 32 << 20 is the maxMemory param for ParseMultipartForm, equals to 32MB (1MB = 1024 * 1024 bytes = 2^20 bytes)
+    // After you call ParseMultipartForm, the file will be saved in the server memory with maxMemory size.
+    // If the file size is larger than maxMemory, the rest of the data will be saved in a system temporary file.
     r.ParseMultipartForm(32 << 20)
 
     // Parse from form data.
@@ -98,7 +125,7 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
     lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
     lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
     p := &Post{
-        User:    "1111",
+        User:    username.(string),
         Message: r.FormValue("message"),
         Location: Location{
             Lat: lat,
@@ -133,7 +160,34 @@ func handlerPost(w http.ResponseWriter, r *http.Request) {
     saveToES(p, id)
 
     // Save to BigTable.
-    //saveToBigTable(p, id)
+    saveToBigTable(p, id)
+}
+
+func saveToBigTable(p *Post, id string) {
+    ctx :=  context.Background()
+    bt_client, err := bigtable.NewClient(ctx, PROJECT_ID, BT_INSTANCE)
+    if err != nil {
+        panic(err)
+        return
+    }
+
+
+    tbl := bt_client.Open("post")
+    mut := bigtable.NewMutation()
+    t := bigtable.Now()
+
+    mut.Set("post", "user", t, []byte(p.User))
+    mut.Set("post", "message", t, []byte(p.Message))
+    mut.Set("location", "lat", t, []byte(strconv.FormatFloat(p.Location.Lat, 'f', -1, 64)))
+    mut.Set("location", "lon", t, []byte(strconv.FormatFloat(p.Location.Lon, 'f', -1, 64)))
+
+    err = tbl.Apply(ctx, id, mut)
+    if err != nil {
+        panic(err)
+        return
+    }
+    fmt.Printf("Post is saved to BigTable: %s\n", p.Message)
+
 }
 
 func saveToGCS(ctx context.Context, r io.Reader, bucketName, name string)(*storage.ObjectHandle, *storage.ObjectAttrs, error) {
